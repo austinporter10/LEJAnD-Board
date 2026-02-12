@@ -17,6 +17,7 @@ uint64_t previous_board_state = 0;
 uint64_t current_board_state = 0;
 bool piece_lifted = false;
 int lifted_square = -1;
+bool ignore_next_change = false;  // Flag to ignore AI's simulated move
 
 // Simulation mode
 bool simulation_mode = true;  // Set to false when using real sensors
@@ -81,6 +82,12 @@ void simulatePhysicalMove(const char* move_str) {
   simulated_board_state &= ~(1ULL << to_idx);    // Add to destination
   
   Serial.println("Move completed");
+}
+
+// Undo a simulated move (restore previous state)
+void undoSimulatedMove(uint64_t restore_state) {
+  simulated_board_state = restore_state;
+  Serial.println("Board state restored to previous position");
 }
 
 // Detect move from board state changes
@@ -148,8 +155,23 @@ void print_board() {
   Serial.println("");
 }
 
-void print_sensor_board(uint64_t board_state) {
+void print_binary_64(uint64_t value) {
+  Serial.print("Binary: 0b");
+  for (int i = 63; i >= 0; i--) {
+    Serial.print((value & (1ULL << i)) ? '1' : '0');
+    if (i % 8 == 0 && i > 0) {
+      Serial.print('_');  // Add separator every 8 bits for readability
+    }
+  }
   Serial.println("");
+  Serial.print("Hex: 0x");
+  // Print in uppercase hex
+  char hex[17];
+  sprintf(hex, "%08lX%08lX", (unsigned long)(value >> 32), (unsigned long)(value & 0xFFFFFFFF));
+  Serial.println(hex);
+}
+
+void print_sensor_board(uint64_t board_state) {
   Serial.println("Sensor Board State (0=piece, 1=empty):");
   Serial.println("  +-----------------+");
   for (int rank = 7; rank >= 0; rank--) {  // Start from rank 8 (index 7) down to rank 1 (index 0)
@@ -171,6 +193,8 @@ void print_sensor_board(uint64_t board_state) {
   }
   Serial.println("  +-----------------+");
   Serial.println("    a b c d e f g h");
+  Serial.println("");
+  print_binary_64(board_state);
   Serial.println("");
 }
 
@@ -205,7 +229,7 @@ void mcumaxMoveToString(mcumax_move move, char* move_str) {
   sprintf(move_str, "%s%s", from_sq, to_sq);
 }
 
-mcumax_square get_square(char *s) {
+mcumax_square get_square(const char *s) {
   mcumax_square rank = s[0] - 'a';
   if (rank > 7)
     return MCUMAX_SQUARE_INVALID;
@@ -254,6 +278,34 @@ bool get_serial_input() {
   return false;
 }
 
+// Validate a move before simulating it
+bool validateAndSimulateMove(const char* move_str) {
+  mcumax_move move = (mcumax_move){
+    get_square(move_str),
+    get_square(move_str + 2),
+  };
+  
+  // Check if it's a valid move
+  mcumax_move valid_moves[GAME_VALID_MOVES_NUM_MAX];
+  uint32_t valid_moves_num = mcumax_search_valid_moves(valid_moves, GAME_VALID_MOVES_NUM_MAX);
+  bool is_valid_move = false;
+  for (uint32_t i = 0; i < valid_moves_num; i++) {
+    if ((valid_moves[i].from == move.from) && (valid_moves[i].to == move.to)) {
+      is_valid_move = true;
+      break;
+    }
+  }
+  
+  if (!is_valid_move) {
+    Serial.println("INVALID MOVE! That move is not legal in the current position.");
+    return false;
+  }
+  
+  // Simulate the move
+  simulatePhysicalMove(move_str);
+  return true;
+}
+
 void setup() {
   Serial.begin(9600);
   init_serial_input();
@@ -287,59 +339,86 @@ void loop() {
   
   // Check if board state changed
   if (new_board_state != current_board_state) {
+    uint64_t state_before_move = current_board_state;  // Save state before processing move
     previous_board_state = current_board_state;
     current_board_state = new_board_state;
     
-    char move_str[5];
-    if (detectMove(previous_board_state, current_board_state, move_str)) {
-      Serial.println("");
-      Serial.print("Move detected: ");
-      Serial.println(move_str);
-      
-      mcumax_move move = (mcumax_move){
-        get_square(move_str + 0),
-        get_square(move_str + 2),
-      };
-      
-      mcumax_move valid_moves[GAME_VALID_MOVES_NUM_MAX];
-      uint32_t valid_moves_num = mcumax_search_valid_moves(valid_moves, GAME_VALID_MOVES_NUM_MAX);
-      bool is_valid_move = false;
-      for (uint32_t i = 0; i < valid_moves_num; i++)
-        if ((valid_moves[i].from == move.from) &&
-          (valid_moves[i].to == move.to))
-          is_valid_move = true;
-      
-      if (!is_valid_move || !mcumax_play_move(move))
-        Serial.println("Invalid move.");
-      else {
-        Serial.println("Calculating AI response...");
-        mcumax_move ai_move = mcumax_search_best_move(MCUMAX_NODE_MAX, MCUMAX_DEPTH_MAX);
-        if (ai_move.from == MCUMAX_SQUARE_INVALID)
-          Serial.println("Game over.");
-        else if (mcumax_play_move(ai_move)) {
-          Serial.print("AI moves: ");
-          print_move(ai_move);
-          Serial.println("");
-          
-          // In simulation mode, automatically make the AI move
-          if (simulation_mode) {
-            char ai_move_str[5];
-            mcumaxMoveToString(ai_move, ai_move_str);
-            
-            Serial.println("Simulating AI move...");
-            delay(1000);
-            simulatePhysicalMove(ai_move_str);
-          } else {
-            Serial.println("Please make the AI's move on the board.");
-          }
-        }
-      }
-      
-      print_board();
+    // Check if we should ignore this change (AI just moved)
+    if (ignore_next_change) {
+      ignore_next_change = false;
+      // Print sensor state after AI move
       print_sensor_board(current_board_state);
-      
       if (simulation_mode) {
         Serial.print("Ready> ");
+      }
+    } else {
+      char move_str[5];
+      if (detectMove(previous_board_state, current_board_state, move_str)) {
+        Serial.println("");
+        Serial.print("Move detected: ");
+        Serial.println(move_str);
+        
+        mcumax_move move = (mcumax_move){
+          get_square(move_str),
+          get_square(move_str + 2),
+        };
+        
+        mcumax_move valid_moves[GAME_VALID_MOVES_NUM_MAX];
+        uint32_t valid_moves_num = mcumax_search_valid_moves(valid_moves, GAME_VALID_MOVES_NUM_MAX);
+        bool is_valid_move = false;
+        for (uint32_t i = 0; i < valid_moves_num; i++)
+          if ((valid_moves[i].from == move.from) &&
+            (valid_moves[i].to == move.to))
+            is_valid_move = true;
+        
+        if (!is_valid_move || !mcumax_play_move(move)) {
+          Serial.println("INVALID MOVE! Please place the pieces back.");
+          
+          // Reset sensor state to what it was before the invalid move
+          if (simulation_mode) {
+            undoSimulatedMove(state_before_move);
+            current_board_state = state_before_move;
+          }
+          
+          print_sensor_board(current_board_state);
+          
+          if (simulation_mode) {
+            Serial.print("Ready> ");
+          }
+        } else {
+          // Print sensor state after player move
+          print_sensor_board(current_board_state);
+          
+          Serial.println("Calculating AI response...");
+          mcumax_move ai_move = mcumax_search_best_move(MCUMAX_NODE_MAX, MCUMAX_DEPTH_MAX);
+          if (ai_move.from == MCUMAX_SQUARE_INVALID) {
+            Serial.println("Game over.");
+            print_board();
+            if (simulation_mode) {
+              Serial.print("Ready> ");
+            }
+          } else if (mcumax_play_move(ai_move)) {
+            Serial.print("AI moves: ");
+            print_move(ai_move);
+            Serial.println("");
+            
+            // In simulation mode, automatically make the AI move
+            if (simulation_mode) {
+              char ai_move_str[5];
+              mcumaxMoveToString(ai_move, ai_move_str);
+              
+              Serial.println("Simulating AI move...");
+              ignore_next_change = true;  // Ignore the change we're about to make
+              delay(1000);
+              simulatePhysicalMove(ai_move_str);
+            } else {
+              Serial.println("Please make the AI's move on the board.");
+            }
+            
+            print_board();
+            // Sensor state will be printed when the change is detected
+          }
+        }
       }
     }
   }
@@ -359,9 +438,14 @@ void loop() {
       return;
     }
     
-    // Simulate the physical move
+    // Validate and simulate the physical move
     if (strlen(serial_input) == 4) {
-      simulatePhysicalMove(serial_input);
+      if (!validateAndSimulateMove(serial_input)) {
+        // Invalid move, don't proceed
+        init_serial_input();
+        Serial.print("Ready> ");
+        return;
+      }
     }
     
     init_serial_input();
